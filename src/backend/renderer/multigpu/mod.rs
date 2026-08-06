@@ -31,6 +31,9 @@
 //! The implementation strives for the best possible performance for a given setup,
 //! when choosing a copy-path.
 //!
+//! Client dma-shadow copies use [`transfer`] for fourcc preference and operational
+//! retry (a successful lower-precision transfer is preferred over failing the frame).
+//!
 //! Any `ExportMem`-implementations will originate from the render-gpu, which again
 //! needs to support the requested format directly. No paths across other gpus are tested.
 //!
@@ -66,7 +69,7 @@ use crate::{
         allocator::{
             Allocator, Buffer as BufferTrait, Format, Fourcc, Modifier,
             dmabuf::{AnyError, Dmabuf},
-            format::{FormatSet, get_bpp},
+            format::FormatSet,
         },
         drm::DrmNode,
         renderer::FrameContext,
@@ -79,6 +82,11 @@ use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
 #[cfg(all(feature = "backend_gbm", feature = "backend_egl", feature = "renderer_gl"))]
 pub mod gbm;
+
+mod transfer;
+use transfer::{
+    intersect_transfer_candidates, ordered_transfer_fourccs, try_ordered_transfer_formats,
+};
 
 /// Tracks available gpus from a given [`GraphicsApi`]
 #[derive(Debug)]
@@ -2355,110 +2363,22 @@ where
     }
 }
 
-fn dma_shadow_copy<S, T>(
+/// Draw `src_texture` into the dmabuf shadow held in `slot` (must be `Some`).
+fn render_into_shadow_slot<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
     slot: &mut Option<(Dmabuf, Box<dyn Any + 'static>, Option<SyncPoint>)>,
     src: &mut S::Device,
-    mut target: Option<&mut T::Device>,
-    transfer_format: Option<Fourcc>,
+    is_new_buffer: bool,
 ) -> Result<(), Error<S, T>>
 where
     S: GraphicsApi,
     T: GraphicsApi,
-    <S::Device as ApiDevice>::Renderer: Renderer + ImportDma + Bind<Dmabuf>,
-    <T::Device as ApiDevice>::Renderer: Renderer + ImportDma,
-    <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
-    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+    <S::Device as ApiDevice>::Renderer: Renderer + Bind<Dmabuf>,
 {
-    if target
-        .as_ref()
-        .is_some_and(|target| !target.can_do_cross_device_imports() || !src.should_do_cross_device_exports())
-    {
-        return Err(Error::ImportFailed);
-    }
-
-    let format = src_texture.format().unwrap_or(Fourcc::Abgr8888);
-
-    let ((shadow_buffer, _, existing_sync_point), is_new_buffer) = if slot.is_some() {
-        (slot.as_mut().unwrap(), false)
-    } else {
-        let read_formats = if let Some(target) = target.as_ref() {
-            ImportDma::dmabuf_formats(target.renderer())
-        } else {
-            ImportDma::dmabuf_formats(src.renderer())
-        };
-        let write_formats = Bind::<Dmabuf>::supported_formats(src.renderer()).ok_or(Error::ImportFailed)?;
-        let candidates = read_formats
-            .intersection(&write_formats)
-            .filter(|f| f.modifier != Modifier::Invalid)
-            .copied()
-            .collect::<FormatSet>();
-
-        if candidates.indexset().is_empty() {
-            return Err(Error::ImportFailed);
-        }
-
-        let transfer_format = match transfer_format {
-            Some(fmt) if candidates.iter().any(|f| f.code == fmt) => fmt,
-            Some(_) => return Err(Error::ImportFailed),
-            None => {
-                if candidates.iter().any(|f| f.code == format) {
-                    format
-                } else {
-                    let bpp = get_bpp(format).unwrap_or(8);
-                    if let Some(f) = candidates
-                        .iter()
-                        .find(|f| get_bpp(f.code).is_some_and(|val| val == bpp))
-                    {
-                        f.code
-                    } else {
-                        candidates
-                            .iter()
-                            .find(|f| get_bpp(f.code).is_some_and(|val| val == 8))
-                            .map(|f| f.code)
-                            .ok_or(Error::ImportFailed)?
-                    }
-                }
-            }
-        };
-
-        let modifiers = candidates
-            .into_iter()
-            .filter(|f| f.code == transfer_format)
-            .map(|f| f.modifier)
-            .collect::<Vec<_>>();
-
-        if modifiers.is_empty() {
-            return Err(Error::ImportFailed);
-        }
-
-        let shadow_buffer = src
-            .allocator()
-            .create_buffer(
-                src_texture.width(),
-                src_texture.height(),
-                transfer_format,
-                &modifiers,
-            )
-            .map_err(Error::AllocatorError)?;
-
-        let target_texture = if let Some(target) = target.as_mut() {
-            Box::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>::new(
-                target
-                    .renderer_mut()
-                    .import_dmabuf(&shadow_buffer, None)
-                    .map_err(Error::Target)?,
-            ) as Box<dyn Any + 'static>
-        } else {
-            Box::<<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>::new(
-                src.renderer_mut()
-                    .import_dmabuf(&shadow_buffer, None)
-                    .map_err(Error::Render)?,
-            ) as Box<dyn Any + 'static>
-        };
-        (slot.insert((shadow_buffer, target_texture, None)), true)
-    };
+    let (shadow_buffer, _, existing_sync_point) = slot.as_mut().ok_or(Error::ImportFailed)?;
+    let shadow_size = Size::from((src_texture.width() as i32, src_texture.height() as i32));
+    let damage_slice = [Rectangle::from_size(shadow_size)];
 
     let src_renderer = src.renderer_mut();
     if let Some(sync) = existing_sync_point.take() {
@@ -2467,13 +2387,12 @@ where
             let _ = sync.wait();
         }
     }
+
     let mut framebuffer = src_renderer.bind(shadow_buffer).map_err(Error::Render)?;
-    let shadow_size = Size::from((src_texture.width() as i32, src_texture.height() as i32));
     let mut frame = src_renderer
         .render(&mut framebuffer, shadow_size, Transform::Normal)
         .map_err(Error::Render)?;
 
-    let damage_slice = [Rectangle::from_size(shadow_size)];
     let damage = unsafe {
         std::mem::transmute::<Option<&[Rectangle<i32, BufferCoords>]>, Option<&[Rectangle<i32, Physical>]>>(
             damage,
@@ -2497,9 +2416,151 @@ where
         )
         .map_err(Error::Render)?;
     *existing_sync_point = Some(frame.finish().map_err(Error::Render)?);
-
-    // shadow buffer contains our copy and is readable by target and the original buffer was never migrated
     Ok(())
+}
+
+/// Copy a client texture into a dma shadow, retrying transfer fourccs on failure.
+fn dma_shadow_copy<S, T>(
+    src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+    slot: &mut Option<(Dmabuf, Box<dyn Any + 'static>, Option<SyncPoint>)>,
+    src: &mut S::Device,
+    mut target: Option<&mut T::Device>,
+    transfer_format: Option<Fourcc>,
+) -> Result<(), Error<S, T>>
+where
+    S: GraphicsApi,
+    T: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: Renderer + ImportDma + Bind<Dmabuf>,
+    <T::Device as ApiDevice>::Renderer: Renderer + ImportDma,
+    <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+{
+    if target
+        .as_ref()
+        .is_some_and(|target| !target.can_do_cross_device_imports() || !src.should_do_cross_device_exports())
+    {
+        return Err(Error::ImportFailed);
+    }
+
+    let source_format = src_texture.format().unwrap_or(Fourcc::Abgr8888);
+
+    // Reuse a cached shadow when it still works.
+    if slot.is_some() {
+        match render_into_shadow_slot::<S, T>(src_texture, damage, slot, src, false) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                debug!(
+                    ?err,
+                    ?source_format,
+                    size = ?(src_texture.width(), src_texture.height()),
+                    "existing multigpu shadow unusable; reallocating"
+                );
+                *slot = None;
+            }
+        }
+    }
+
+    let read_formats = if let Some(target) = target.as_ref() {
+        ImportDma::dmabuf_formats(target.renderer())
+    } else {
+        ImportDma::dmabuf_formats(src.renderer())
+    };
+    let write_formats = Bind::<Dmabuf>::supported_formats(src.renderer()).ok_or(Error::ImportFailed)?;
+    let candidates = intersect_transfer_candidates(&read_formats, &write_formats);
+    if candidates.indexset().is_empty() {
+        return Err(Error::ImportFailed);
+    }
+
+    let format_order = ordered_transfer_fourccs(transfer_format, source_format, &candidates)
+        .map_err(|()| Error::ImportFailed)?;
+
+    match try_ordered_transfer_formats(format_order, &candidates, |code, modifiers| {
+        let shadow_buffer = src
+            .allocator()
+            .create_buffer(
+                src_texture.width(),
+                src_texture.height(),
+                code,
+                modifiers,
+            )
+            .map_err(|err| {
+                let err = Error::AllocatorError(err);
+                debug!(?err, ?code, "multigpu shadow allocate failed; trying next transfer format");
+                err
+            })?;
+
+        let target_texture = if let Some(target) = target.as_mut() {
+            match target.renderer_mut().import_dmabuf(&shadow_buffer, None) {
+                Ok(tex) => {
+                    Box::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>::new(tex)
+                        as Box<dyn Any + 'static>
+                }
+                Err(err) => {
+                    let err = Error::Target(err);
+                    debug!(
+                        ?err,
+                        ?code,
+                        "multigpu shadow import on target failed; trying next transfer format"
+                    );
+                    return Err(err);
+                }
+            }
+        } else {
+            match src.renderer_mut().import_dmabuf(&shadow_buffer, None) {
+                Ok(tex) => {
+                    Box::<<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>::new(tex)
+                        as Box<dyn Any + 'static>
+                }
+                Err(err) => {
+                    let err = Error::Render(err);
+                    debug!(
+                        ?err,
+                        ?code,
+                        "multigpu shadow import on src failed; trying next transfer format"
+                    );
+                    return Err(err);
+                }
+            }
+        };
+
+        *slot = Some((shadow_buffer, target_texture, None));
+        match render_into_shadow_slot::<S, T>(src_texture, damage, slot, src, true) {
+            Ok(()) => {
+                if code != source_format {
+                    info!(
+                        ?source_format,
+                        transfer = ?code,
+                        size = ?(src_texture.width(), src_texture.height()),
+                        "multigpu shadow copy succeeded with degraded transfer format"
+                    );
+                }
+                Ok(())
+            }
+            Err(err) => {
+                debug!(
+                    ?err,
+                    ?code,
+                    ?source_format,
+                    size = ?(src_texture.width(), src_texture.height()),
+                    "multigpu shadow bind/draw failed; trying next transfer format"
+                );
+                *slot = None;
+                Err(err)
+            }
+        }
+    }) {
+        Ok(()) => Ok(()),
+        Err(last_err) => {
+            warn!(
+                ?source_format,
+                size = ?(src_texture.width(), src_texture.height()),
+                ?last_err,
+                "multigpu shadow copy exhausted transfer format preferences"
+            );
+            Err(last_err.unwrap_or(Error::ImportFailed))
+        }
+    }
 }
 
 type BoxedTextureMappingAndDamage<S> = (
