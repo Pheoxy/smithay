@@ -752,6 +752,12 @@ impl GlesRenderer {
     }
 
     fn bind_texture<'a>(&mut self, texture: &'a GlesTexture) -> Result<GlesTarget<'a>, GlesError> {
+        // EXTERNAL_OES textures are sample-only; attaching them as TEXTURE_2D color
+        // attachments always yields an incomplete FBO.
+        if texture.0.is_external {
+            return Err(GlesError::UnsupportedPixelLayout);
+        }
+
         unsafe {
             self.egl.make_current()?;
         }
@@ -782,6 +788,12 @@ impl GlesRenderer {
 
                 if status != ffi::FRAMEBUFFER_COMPLETE {
                     self.gl.DeleteFramebuffers(1, &mut fbo as *mut _);
+                    debug!(
+                        status,
+                        format = ?texture.0.format,
+                        size = ?texture.0.size,
+                        "incomplete GL framebuffer when binding texture as render target"
+                    );
                     return Err(GlesError::FramebufferBindingError);
                 }
             }
@@ -1429,6 +1441,10 @@ impl ExportMem for GlesRenderer {
     }
 
     fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, GlesError> {
+        // EXTERNAL_OES / sample-only textures cannot be bound as FBOs for readback.
+        if texture.0.is_external {
+            return Ok(false);
+        }
         // if we can't bind the texture, we can't read it
         Ok(self.bind_texture(texture).is_ok())
     }
