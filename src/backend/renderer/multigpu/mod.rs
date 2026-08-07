@@ -2848,10 +2848,16 @@ where
                     None
                 };
                 match via_dmabuf {
-                    Some(Ok(())) => Ok(()),
+                    Some(Ok(())) => {
+                        trace!("cpu-copy via Bind+copy_framebuffer");
+                        Ok(())
+                    }
                     other => {
                         if let Some(Err(err)) = other {
-                            trace!(?err, "mem_copy_via_dmabuf failed; trying texture mem_copy");
+                            trace!(
+                                ?err,
+                                "cpu-copy Bind+copy_framebuffer failed, trying copy_texture"
+                            );
                         }
                         let mem_src = external_shadow
                             .as_ref()
@@ -2861,7 +2867,11 @@ where
                                     .unwrap()
                             })
                             .unwrap_or(src_texture);
-                        mem_copy::<S, T>(mem_src, damage, &mut slot, src, target)
+                        let res = mem_copy::<S, T>(mem_src, damage, &mut slot, src, target);
+                        if res.is_ok() {
+                            trace!("cpu-copy via copy_texture");
+                        }
+                        res
                     }
                 }
             };
@@ -2932,10 +2942,16 @@ where
                             None
                         };
                         match via_dmabuf {
-                            Some(Ok(())) => Ok(()),
+                            Some(Ok(())) => {
+                                trace!("cpu-copy via Bind+copy_framebuffer");
+                                Ok(())
+                            }
                             other => {
                                 if let Some(Err(err)) = other {
-                                    trace!(?err, "mem_copy_via_dmabuf failed; trying texture mem_copy");
+                                    trace!(
+                                        ?err,
+                                        "cpu-copy Bind+copy_framebuffer failed, trying copy_texture"
+                                    );
                                 }
                                 let mem_src_texture = external_shadow
                                     .as_ref()
@@ -2953,8 +2969,15 @@ where
                                     src,
                                     target,
                                 ) {
-                                    Ok(res) => Ok(res),
-                                    Err(_) => {
+                                    Ok(res) => {
+                                        trace!("cpu-copy via copy_texture");
+                                        Ok(res)
+                                    }
+                                    Err(err) => {
+                                        trace!(
+                                            ?err,
+                                            "cpu-copy failed, forcing Abgr8888 intermediate"
+                                        );
                                         let mut dma_slot = None;
                                         dma_shadow_copy::<S, S>(
                                             src_texture,
@@ -2990,8 +3013,17 @@ where
                                             None
                                         };
                                         match via {
-                                            Some(Ok(())) => Ok(()),
-                                            _ => {
+                                            Some(Ok(())) => {
+                                                trace!("cpu-copy via Bind+copy_framebuffer");
+                                                Ok(())
+                                            }
+                                            other => {
+                                                if let Some(Err(err)) = other {
+                                                    trace!(
+                                                        ?err,
+                                                        "cpu-copy Bind+copy_framebuffer failed, trying copy_texture"
+                                                    );
+                                                }
                                                 let src_texture = external_shadow
                                                     .as_ref()
                                                     .map(|(_, texture)| {
@@ -3000,13 +3032,17 @@ where
                                                             .unwrap()
                                                     })
                                                     .unwrap_or(src_texture);
-                                                mem_copy::<S, T>(
+                                                let res = mem_copy::<S, T>(
                                                     src_texture,
                                                     damage,
                                                     &mut mem_slot,
                                                     src,
                                                     target,
-                                                )
+                                                );
+                                                if res.is_ok() {
+                                                    trace!("cpu-copy via copy_texture");
+                                                }
+                                                res
                                             }
                                         }
                                     }
