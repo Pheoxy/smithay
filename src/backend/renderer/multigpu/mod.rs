@@ -2512,6 +2512,142 @@ type MemTexture<S, T> = (
     Option<Box<<<<T as GraphicsApi>::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>>,
 );
 
+fn merge_damage(
+    full_rect: Rectangle<i32, BufferCoords>,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+) -> Option<Vec<Rectangle<i32, BufferCoords>>> {
+    damage.map(|damage| {
+        damage
+            .iter()
+            .flat_map(|rect| rect.intersection(full_rect))
+            .fold(Vec::<Rectangle<i32, BufferCoords>>::new(), |damage, mut rect| {
+                // replace with drain_filter, when that becomes stable to reuse the original Vec's memory
+                let (overlapping, mut new_damage): (Vec<_>, Vec<_>) = damage
+                    .into_iter()
+                    .partition(|other| other.overlaps_or_touches(rect));
+
+                for overlap in overlapping {
+                    rect = rect.merge(overlap);
+                }
+                new_damage.push(rect);
+                new_damage
+            })
+    })
+}
+
+/// Shared CPU-import path: export the needed regions via `export_regions`, then map + import into `slot`.
+///
+/// `export_regions` is called once per batch of rectangles that still need a mapping (either a single
+/// full-buffer rect or a list of damage rects) and must return one mapping per region, in order.
+fn mem_copy_with_export<S, T, F>(
+    format: Fourcc,
+    full_rect: Rectangle<i32, BufferCoords>,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+    slot: &mut Option<MemTexture<S, T>>,
+    src: &mut S::Device,
+    target: &mut T::Device,
+    mut export_regions: F,
+) -> Result<(), Error<S, T>>
+where
+    S: GraphicsApi,
+    T: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: Renderer + ExportMem,
+    <T::Device as ApiDevice>::Renderer: Renderer + ImportMem,
+    F: FnMut(
+        &mut S::Device,
+        &[Rectangle<i32, BufferCoords>],
+        Fourcc,
+    ) -> Result<
+        Vec<<<S::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping>,
+        Error<S, T>,
+    >,
+{
+    let damage = merge_damage(full_rect, damage);
+
+    if slot.is_some() {
+        let (mapping, texture) = slot.as_mut().unwrap();
+        let mappings = match mapping.take() {
+            Some(mut mappings) => {
+                mappings.retain(|(mapping, _)| TextureMapping::format(&**mapping) == format);
+
+                let damage_slice = [full_rect];
+                let new_damage = damage
+                    .as_deref()
+                    .unwrap_or(&damage_slice)
+                    .iter()
+                    .filter(|rect| !mappings.iter().any(|(_, region)| region.contains_rect(**rect)))
+                    .copied()
+                    .collect::<Vec<_>>();
+
+                if texture.is_none()
+                    && (mappings.len() != 1
+                        || <dyn TextureMapping>::size(&*mappings[0].0) != full_rect.size
+                        || !new_damage.is_empty())
+                {
+                    let exported = export_regions(src, std::slice::from_ref(&full_rect), format)?;
+                    trace!("Creating mapping for: {:?}", damage);
+                    mappings = exported
+                        .into_iter()
+                        .map(|mapping| (Box::new(mapping), full_rect))
+                        .collect();
+                } else if !new_damage.is_empty() {
+                    let exported = export_regions(src, &new_damage, format)?;
+                    for (region, mapping) in new_damage.into_iter().zip(exported) {
+                        trace!("Creating mapping for: {:?}", region);
+                        mappings.push((Box::new(mapping), region));
+                    }
+                }
+
+                mappings
+            }
+            None => {
+                let exported = export_regions(src, std::slice::from_ref(&full_rect), format)?;
+                trace!("Creating mapping for: {:?}", damage);
+                exported
+                    .into_iter()
+                    .map(|mapping| (Box::new(mapping), full_rect))
+                    .collect()
+            }
+        };
+
+        for (mapping, region) in mappings {
+            let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
+            if let Some(texture) = texture.as_mut() {
+                trace!(
+                    "Updating texture {:?} with mapping at {:?}",
+                    texture.size(),
+                    region,
+                );
+                target
+                    .renderer_mut()
+                    .update_memory(texture, data, region)
+                    .map_err(Error::Target)?;
+            } else {
+                trace!("Importing mapping as full buffer {:?}", mapping.size());
+                let target_texture = target
+                    .renderer_mut()
+                    .import_memory(data, format, full_rect.size, false)
+                    .map_err(Error::Target)?;
+                *texture = Some(Box::new(target_texture));
+            }
+        }
+    } else {
+        let exported = export_regions(src, std::slice::from_ref(&full_rect), format)?;
+        // First export is the full buffer used for the initial import.
+        let mapping = exported.into_iter().next().ok_or(Error::ImportFailed)?;
+        trace!("Importing mapping as full buffer {:?}", mapping.size());
+        let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
+
+        let target_texture = target
+            .renderer_mut()
+            .import_memory(data, format, full_rect.size, false)
+            .map_err(Error::Target)?;
+        *slot = Some((None, Some(Box::new(target_texture))));
+    };
+
+    Ok(())
+}
+
 fn mem_copy<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
@@ -2533,123 +2669,24 @@ where
         // TODO: Re-evaluate this, once we support vulkan
         .unwrap_or(Fourcc::Abgr8888);
 
-    let texture_rect = Rectangle::from_size((src_texture.width() as i32, src_texture.height() as i32).into());
-    let damage = damage.map(|damage| {
-        damage
+    let full_rect = Rectangle::from_size((src_texture.width() as i32, src_texture.height() as i32).into());
+    mem_copy_with_export(format, full_rect, damage, slot, src, target, |src: &mut S::Device, regions, format| {
+        regions
             .iter()
-            .flat_map(|rect| rect.intersection(texture_rect))
-            .fold(Vec::<Rectangle<i32, BufferCoords>>::new(), |damage, mut rect| {
-                // replace with drain_filter, when that becomes stable to reuse the original Vec's memory
-                let (overlapping, mut new_damage): (Vec<_>, Vec<_>) = damage
-                    .into_iter()
-                    .partition(|other| other.overlaps_or_touches(rect));
-
-                for overlap in overlapping {
-                    rect = rect.merge(overlap);
-                }
-                new_damage.push(rect);
-                new_damage
+            .map(|region| {
+                src.renderer_mut()
+                    .copy_texture(src_texture, *region, format)
+                    .map_err(Error::Render)
             })
-    });
-
-    if slot.is_some() {
-        let (mapping, texture) = slot.as_mut().unwrap();
-        let mappings = match mapping.take() {
-            Some(mut mappings) => {
-                mappings.retain(|(mapping, _)| TextureMapping::format(&**mapping) == format);
-
-                let damage_slice = [texture_rect];
-                let new_damage = damage
-                    .as_deref()
-                    .unwrap_or(&damage_slice)
-                    .iter()
-                    .filter(|rect| !mappings.iter().any(|(_, region)| region.contains_rect(**rect)))
-                    .copied()
-                    .collect::<Vec<_>>();
-
-                if texture.is_none()
-                    && (mappings.len() != 1
-                        || <dyn TextureMapping>::size(&*mappings[0].0) != texture_rect.size
-                        || !new_damage.is_empty())
-                {
-                    let mapping = src
-                        .renderer_mut()
-                        .copy_texture(src_texture, texture_rect, format)
-                        .map_err(Error::Render)?;
-                    trace!("Creating mapping for: {:?}", damage);
-                    mappings = vec![(Box::new(mapping), texture_rect)];
-                } else {
-                    mappings.extend(
-                        new_damage
-                            .into_iter()
-                            .map(|damage| {
-                                let mapping = src
-                                    .renderer_mut()
-                                    .copy_texture(src_texture, damage, format)
-                                    .map_err(Error::Render)?;
-                                trace!("Creating mapping for: {:?}", damage);
-                                Ok((Box::new(mapping), damage))
-                            })
-                            .collect::<Result<Vec<_>, Error<S, T>>>()?,
-                    );
-                }
-
-                mappings
-            }
-            None => {
-                let mapping = src
-                    .renderer_mut()
-                    .copy_texture(src_texture, texture_rect, format)
-                    .map_err(Error::Render)?;
-                trace!("Creating mapping for: {:?}", damage);
-                vec![(Box::new(mapping), texture_rect)]
-            }
-        };
-
-        for (mapping, damage) in mappings {
-            let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
-            if let Some(texture) = texture.as_mut() {
-                trace!(
-                    "Updating texture {:?} with mapping at {:?}",
-                    texture.size(),
-                    damage,
-                );
-                target
-                    .renderer_mut()
-                    .update_memory(texture, data, damage)
-                    .map_err(Error::Target)?;
-            } else {
-                trace!("Importing mapping as full buffer {:?}", mapping.size());
-                let target_texture = target
-                    .renderer_mut()
-                    .import_memory(data, format, texture_rect.size, false)
-                    .map_err(Error::Target)?;
-                *texture = Some(Box::new(target_texture));
-            }
-        }
-    } else {
-        let mapping = src
-            .renderer_mut()
-            .copy_texture(src_texture, texture_rect, format)
-            .map_err(Error::Render)?;
-        trace!("Importing mapping as full buffer {:?}", mapping.size());
-        let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
-
-        let target_texture = target
-            .renderer_mut()
-            .import_memory(data, format, texture_rect.size, false)
-            .map_err(Error::Target)?;
-        *slot = Some((None, Some(Box::new(target_texture))));
-    };
-
-    Ok(())
+            .collect()
+    })
 }
 
 /// CPU-export pixels from a dmabuf via [`Bind`] + [`ExportMem::copy_framebuffer`].
 ///
-/// Unlike [`mem_copy`] (which uses `copy_texture` and only texture FBOs), this path
-/// reuses `Bind<Dmabuf>` so GLES may attach via renderbuffer when texture FBO is
-/// incomplete. Prefer when an intermediate dmabuf was drawn with Bind.
+/// Prefer this over [`mem_copy`] when an intermediate dmabuf was drawn with `Bind`:
+/// that path may use a renderbuffer when a texture FBO is incomplete, while
+/// `copy_texture` only attaches textures.
 fn mem_copy_via_dmabuf<S, T>(
     dmabuf: &mut Dmabuf,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
@@ -2671,118 +2708,199 @@ where
         Fourcc::Abgr8888
     };
 
-    let buffer_rect = Rectangle::from_size(BufferTrait::size(dmabuf));
-    let damage = damage.map(|damage| {
-        damage
-            .iter()
-            .flat_map(|rect| rect.intersection(buffer_rect))
-            .fold(Vec::<Rectangle<i32, BufferCoords>>::new(), |damage, mut rect| {
-                let (overlapping, mut new_damage): (Vec<_>, Vec<_>) = damage
-                    .into_iter()
-                    .partition(|other| other.overlaps_or_touches(rect));
-
-                for overlap in overlapping {
-                    rect = rect.merge(overlap);
-                }
-                new_damage.push(rect);
-                new_damage
-            })
-    });
-
-    let copy_region = |src: &mut S::Device,
-                       dmabuf: &mut Dmabuf,
-                       region: Rectangle<i32, BufferCoords>,
-                       format: Fourcc|
-     -> Result<
-        <<S::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping,
-        Error<S, T>,
-    > {
+    let full_rect = Rectangle::from_size(BufferTrait::size(dmabuf));
+    mem_copy_with_export(format, full_rect, damage, slot, src, target, |src: &mut S::Device, regions, format| {
+        if regions.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One Bind for the whole batch so RBO/texture attach is not repeated per rect.
         let fb = src.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
-        let mapping = ExportMem::copy_framebuffer(src.renderer_mut(), &fb, region, format)
-            .map_err(Error::Render)?;
+        let mut mappings = Vec::with_capacity(regions.len());
+        for region in regions {
+            mappings.push(
+                ExportMem::copy_framebuffer(src.renderer_mut(), &fb, *region, format)
+                    .map_err(Error::Render)?,
+            );
+        }
         drop(fb);
-        Ok(mapping)
-    };
+        Ok(mappings)
+    })
+}
 
-    if slot.is_some() {
-        let (mapping, texture) = slot.as_mut().unwrap();
-        let mappings = match mapping.take() {
-            Some(mut mappings) => {
-                mappings.retain(|(mapping, _)| TextureMapping::format(&**mapping) == format);
+type ExternalShadow = (Dmabuf, Box<dyn Any + 'static>);
 
-                let damage_slice = [buffer_rect];
-                let new_damage = damage
-                    .as_deref()
-                    .unwrap_or(&damage_slice)
-                    .iter()
-                    .filter(|rect| !mappings.iter().any(|(_, region)| region.contains_rect(**rect)))
-                    .copied()
-                    .collect::<Vec<_>>();
+fn wait_optional_sync<S>(src: &mut S::Device, sync_point: Option<SyncPoint>)
+where
+    S: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: Renderer,
+{
+    if let Some(sync) = sync_point {
+        // ignore interrupt errors
+        src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
+            let _ = sync.wait();
+        });
+    }
+}
 
-                if texture.is_none()
-                    && (mappings.len() != 1
-                        || <dyn TextureMapping>::size(&*mappings[0].0) != buffer_rect.size
-                        || !new_damage.is_empty())
-                {
-                    let mapping = copy_region(src, dmabuf, buffer_rect, format)?;
-                    trace!("Creating dmabuf mapping for: {:?}", damage);
-                    mappings = vec![(Box::new(mapping), buffer_rect)];
-                } else {
-                    mappings.extend(
-                        new_damage
-                            .into_iter()
-                            .map(|region| {
-                                let mapping = copy_region(src, dmabuf, region, format)?;
-                                trace!("Creating dmabuf mapping for: {:?}", region);
-                                Ok((Box::new(mapping), region))
-                            })
-                            .collect::<Result<Vec<_>, Error<S, T>>>()?,
-                    );
-                }
+fn shadow_texture_ref<'a, S>(
+    external_shadow: &'a Option<ExternalShadow>,
+    src_texture: &'a <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+) -> &'a <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId
+where
+    S: GraphicsApi,
+    <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+{
+    external_shadow
+        .as_ref()
+        .map(|(_, texture)| {
+            texture
+                .downcast_ref::<<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>()
+                .unwrap()
+        })
+        .unwrap_or(src_texture)
+}
 
-                mappings
+fn build_local_shadow<S, T>(
+    src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+    src: &mut S::Device,
+    transfer_format: Option<Fourcc>,
+) -> Result<ExternalShadow, Error<S, T>>
+where
+    S: GraphicsApi,
+    T: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: Renderer + ImportDma + Bind<Dmabuf>,
+    <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+{
+    let mut shadow_slot = None;
+    dma_shadow_copy::<S, S>(src_texture, damage, &mut shadow_slot, src, None, transfer_format)
+        .map_err(Error::generalize::<T>)?;
+    let (dmabuf, texture, sync_point) = shadow_slot.ok_or(Error::ImportFailed)?;
+    wait_optional_sync::<S>(src, sync_point);
+    Ok((dmabuf, texture))
+}
+
+/// Prefer dmabuf Bind+copy_framebuffer when a local intermediate exists; fall back to texture mem_copy.
+fn cpu_export<S, T>(
+    external_shadow: &mut Option<ExternalShadow>,
+    src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+    mem_slot: &mut Option<MemTexture<S, T>>,
+    src: &mut S::Device,
+    target: &mut T::Device,
+) -> Result<(), Error<S, T>>
+where
+    S: GraphicsApi,
+    T: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: Renderer + ExportMem + Bind<Dmabuf>,
+    <T::Device as ApiDevice>::Renderer: Renderer + ImportMem,
+    <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+{
+    if let Some((dma, _)) = external_shadow.as_mut() {
+        match mem_copy_via_dmabuf::<S, T>(dma, damage, mem_slot, src, target) {
+            Ok(()) => {
+                trace!("cpu-copy via Bind+copy_framebuffer");
+                return Ok(());
             }
-            None => {
-                let mapping = copy_region(src, dmabuf, buffer_rect, format)?;
-                trace!("Creating dmabuf mapping for: {:?}", damage);
-                vec![(Box::new(mapping), buffer_rect)]
-            }
-        };
-
-        for (mapping, region) in mappings {
-            let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
-            if let Some(texture) = texture.as_mut() {
+            Err(err) => {
                 trace!(
-                    "Updating texture {:?} with dmabuf mapping at {:?}",
-                    texture.size(),
-                    region,
+                    ?err,
+                    "cpu-copy Bind+copy_framebuffer failed, trying copy_texture"
                 );
-                target
-                    .renderer_mut()
-                    .update_memory(texture, data, region)
-                    .map_err(Error::Target)?;
-            } else {
-                trace!("Importing dmabuf mapping as full buffer {:?}", mapping.size());
-                let target_texture = target
-                    .renderer_mut()
-                    .import_memory(data, format, buffer_rect.size, false)
-                    .map_err(Error::Target)?;
-                *texture = Some(Box::new(target_texture));
             }
         }
-    } else {
-        let mapping = copy_region(src, dmabuf, buffer_rect, format)?;
-        trace!("Importing dmabuf mapping as full buffer {:?}", mapping.size());
-        let data = src.renderer_mut().map_texture(&mapping).map_err(Error::Render)?;
+    }
 
-        let target_texture = target
-            .renderer_mut()
-            .import_memory(data, format, buffer_rect.size, false)
-            .map_err(Error::Target)?;
-        *slot = Some((None, Some(Box::new(target_texture))));
-    };
+    let res = mem_copy::<S, T>(
+        shadow_texture_ref::<S>(external_shadow, src_texture),
+        damage,
+        mem_slot,
+        src,
+        target,
+    );
+    if res.is_ok() {
+        trace!("cpu-copy via copy_texture");
+    }
+    res
+}
 
-    Ok(())
+/// CPU path after target-side dma_shadow failed: local intermediate if needed, then export.
+///
+/// On export failure, rebuilds the intermediate forced to Abgr8888 and retries once.
+fn cpu_fallback_copy<S, T>(
+    src: &mut S::Device,
+    target: &mut T::Device,
+    src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+) -> Result<(Option<ExternalShadow>, Option<MemTexture<S, T>>), Error<S, T>>
+where
+    S: GraphicsApi,
+    T: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: Renderer + ImportDma + ExportMem + Bind<Dmabuf>,
+    <T::Device as ApiDevice>::Renderer: Renderer + ImportMem,
+    <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+{
+    let mut external_shadow = None;
+    if !ExportMem::can_read_texture(src.renderer_mut(), src_texture).map_err(Error::Render)? {
+        external_shadow = Some(build_local_shadow::<S, T>(src_texture, damage, src, None)?);
+    }
+
+    let mut mem_slot = None;
+    match cpu_export::<S, T>(
+        &mut external_shadow,
+        src_texture,
+        damage,
+        &mut mem_slot,
+        src,
+        target,
+    ) {
+        Ok(()) => Ok((external_shadow, mem_slot)),
+        Err(err) => {
+            trace!(?err, "cpu-copy failed, forcing Abgr8888 intermediate");
+            external_shadow = Some(build_local_shadow::<S, T>(
+                src_texture,
+                damage,
+                src,
+                Some(Fourcc::Abgr8888),
+            )?);
+            cpu_export::<S, T>(
+                &mut external_shadow,
+                src_texture,
+                damage,
+                &mut mem_slot,
+                src,
+                target,
+            )?;
+            Ok((external_shadow, mem_slot))
+        }
+    }
+}
+
+fn mem_slot_to_gpu_texture<S, T>(
+    mem_slot: Option<MemTexture<S, T>>,
+    src_node: DrmNode,
+    external_shadow: Option<ExternalShadow>,
+) -> Option<GpuSingleTexture>
+where
+    S: GraphicsApi,
+    T: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: ExportMem,
+    <<S::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+{
+    mem_slot.map(|(mappings, texture)| GpuSingleTexture::Mem {
+        external_shadow,
+        texture: texture.map(|texture| texture as Box<dyn Any + 'static>),
+        mappings: mappings.map(|mappings| {
+            (
+                src_node,
+                mappings
+                    .into_iter()
+                    .map(|(mapping, damage)| (damage, mapping as Box<dyn Any + 'static>))
+                    .collect(),
+            )
+        }),
+    })
 }
 
 fn texture_copy<S, T>(
@@ -2823,71 +2941,41 @@ where
                 dma_shadow_copy::<S, S>(src_texture, damage, &mut slot, src, None, None)
                     .map_err(Error::generalize::<T>)?;
                 external_shadow = slot.map(|(dmabuf, texture, sync_point)| {
-                    if let Some(sync) = sync_point {
-                        // ignore interrupt errors
-                        src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
-                            let _ = sync.wait();
-                        });
-                    }
+                    wait_optional_sync::<S>(src, sync_point);
                     (dmabuf, texture)
                 });
             }
 
-            let mut slot = Some((
-                mappings.map(|(_, mappings)| mappings.into_iter().map(|(damage, mapping)|
-                    (mapping.downcast::<<<S::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping>().unwrap(), damage)
-                ).collect::<Vec<_>>()),
-                texture.map(|texture| texture.downcast::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>().unwrap())
+            let mut mem_slot = Some((
+                mappings.map(|(_, mappings)| {
+                    mappings
+                        .into_iter()
+                        .map(|(damage, mapping)| {
+                            (
+                                mapping
+                                    .downcast::<<<S::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping>()
+                                    .unwrap(),
+                                damage,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+                texture.map(|texture| {
+                    texture
+                        .downcast::<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>()
+                        .unwrap()
+                }),
             ));
 
-            // Prefer Bind+copy_framebuffer when an intermediate dmabuf is available.
-            let res = {
-                let via_dmabuf = if let Some((dma, _)) = external_shadow.as_mut() {
-                    Some(mem_copy_via_dmabuf::<S, T>(dma, damage, &mut slot, src, target))
-                } else {
-                    None
-                };
-                match via_dmabuf {
-                    Some(Ok(())) => {
-                        trace!("cpu-copy via Bind+copy_framebuffer");
-                        Ok(())
-                    }
-                    other => {
-                        if let Some(Err(err)) = other {
-                            trace!(
-                                ?err,
-                                "cpu-copy Bind+copy_framebuffer failed, trying copy_texture"
-                            );
-                        }
-                        let mem_src = external_shadow
-                            .as_ref()
-                            .map(|(_, texture)| {
-                                texture
-                                    .downcast_ref::<<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>()
-                                    .unwrap()
-                            })
-                            .unwrap_or(src_texture);
-                        let res = mem_copy::<S, T>(mem_src, damage, &mut slot, src, target);
-                        if res.is_ok() {
-                            trace!("cpu-copy via copy_texture");
-                        }
-                        res
-                    }
-                }
-            };
-            *target_texture = slot.map(|(mappings, texture)| GpuSingleTexture::Mem {
-                external_shadow,
-                texture: texture.map(|texture| texture as Box<dyn Any + 'static>),
-                mappings: mappings.map(|mappings| {
-                    (
-                        *src.node(),
-                        mappings
-                            .into_iter()
-                            .map(|(mapping, damage)| (damage, mapping as Box<dyn Any + 'static>))
-                            .collect(),
-                    )
-                }),
-            });
+            let res = cpu_export::<S, T>(
+                &mut external_shadow,
+                src_texture,
+                damage,
+                &mut mem_slot,
+                src,
+                target,
+            );
+            *target_texture = mem_slot_to_gpu_texture::<S, T>(mem_slot, *src.node(), external_shadow);
             res
         }
         Some(GpuSingleTexture::Dma {
@@ -2917,155 +3005,10 @@ where
                 }
                 Err(err) => {
                     trace!(?err, "Dma shadow copy failed, falling back to cpu");
-
-                    let mut external_shadow = None;
-                    if !ExportMem::can_read_texture(src.renderer_mut(), src_texture).map_err(Error::Render)? {
-                        let mut shadow_slot = None;
-                        dma_shadow_copy::<S, S>(src_texture, damage, &mut shadow_slot, src, None, None)
-                            .map_err(Error::generalize::<T>)?;
-                        external_shadow = shadow_slot.map(|(dmabuf, texture, sync_point)| {
-                            if let Some(sync) = sync_point {
-                                // ignore interrupt errors
-                                src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
-                                    let _ = sync.wait();
-                                });
-                            }
-                            (dmabuf, texture as Box<dyn Any + 'static>)
-                        });
-                    };
-
-                    let mut mem_slot = None;
-                    let res = {
-                        let via_dmabuf = if let Some((dma, _)) = external_shadow.as_mut() {
-                            Some(mem_copy_via_dmabuf::<S, T>(dma, damage, &mut mem_slot, src, target))
-                        } else {
-                            None
-                        };
-                        match via_dmabuf {
-                            Some(Ok(())) => {
-                                trace!("cpu-copy via Bind+copy_framebuffer");
-                                Ok(())
-                            }
-                            other => {
-                                if let Some(Err(err)) = other {
-                                    trace!(
-                                        ?err,
-                                        "cpu-copy Bind+copy_framebuffer failed, trying copy_texture"
-                                    );
-                                }
-                                let mem_src_texture = external_shadow
-                                    .as_ref()
-                                    .map(|(_, texture)| {
-                                        texture
-                                            .downcast_ref::<<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>()
-                                            .unwrap()
-                                    })
-                                    .unwrap_or(src_texture);
-
-                                match mem_copy::<S, T>(
-                                    mem_src_texture,
-                                    damage,
-                                    &mut mem_slot,
-                                    src,
-                                    target,
-                                ) {
-                                    Ok(res) => {
-                                        trace!("cpu-copy via copy_texture");
-                                        Ok(res)
-                                    }
-                                    Err(err) => {
-                                        trace!(
-                                            ?err,
-                                            "cpu-copy failed, forcing Abgr8888 intermediate"
-                                        );
-                                        let mut dma_slot = None;
-                                        dma_shadow_copy::<S, S>(
-                                            src_texture,
-                                            damage,
-                                            &mut dma_slot,
-                                            src,
-                                            None,
-                                            Some(Fourcc::Abgr8888),
-                                        )
-                                        .map_err(Error::generalize::<T>)?;
-                                        external_shadow =
-                                            dma_slot.map(|(dmabuf, texture, sync_point)| {
-                                                if let Some(sync) = sync_point {
-                                                    src.renderer_mut().wait(&sync).unwrap_or_else(
-                                                        |_| {
-                                                            let _ = sync.wait();
-                                                        },
-                                                    );
-                                                }
-                                                (dmabuf, texture as Box<dyn Any + 'static>)
-                                            });
-                                        let via = if let Some((dma, _)) =
-                                            external_shadow.as_mut()
-                                        {
-                                            Some(mem_copy_via_dmabuf::<S, T>(
-                                                dma,
-                                                damage,
-                                                &mut mem_slot,
-                                                src,
-                                                target,
-                                            ))
-                                        } else {
-                                            None
-                                        };
-                                        match via {
-                                            Some(Ok(())) => {
-                                                trace!("cpu-copy via Bind+copy_framebuffer");
-                                                Ok(())
-                                            }
-                                            other => {
-                                                if let Some(Err(err)) = other {
-                                                    trace!(
-                                                        ?err,
-                                                        "cpu-copy Bind+copy_framebuffer failed, trying copy_texture"
-                                                    );
-                                                }
-                                                let src_texture = external_shadow
-                                                    .as_ref()
-                                                    .map(|(_, texture)| {
-                                                        texture
-                                                            .downcast_ref::<<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>()
-                                                            .unwrap()
-                                                    })
-                                                    .unwrap_or(src_texture);
-                                                let res = mem_copy::<S, T>(
-                                                    src_texture,
-                                                    damage,
-                                                    &mut mem_slot,
-                                                    src,
-                                                    target,
-                                                );
-                                                if res.is_ok() {
-                                                    trace!("cpu-copy via copy_texture");
-                                                }
-                                                res
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    let slot = mem_slot;
-
-                    *target_texture = slot.map(|(mappings, texture)| GpuSingleTexture::Mem {
-                        texture: texture.map(|texture| texture as Box<dyn Any + 'static>),
-                        mappings: mappings.map(|mappings| {
-                            (
-                                *src.node(),
-                                mappings
-                                    .into_iter()
-                                    .map(|(mapping, damage)| (damage, mapping as Box<dyn Any + 'static>))
-                                    .collect(),
-                            )
-                        }),
-                        external_shadow,
-                    });
-                    res
+                    let (external_shadow, mem_slot) =
+                        cpu_fallback_copy::<S, T>(src, target, src_texture, damage)?;
+                    *target_texture = mem_slot_to_gpu_texture::<S, T>(mem_slot, *src.node(), external_shadow);
+                    Ok(())
                 }
             }
         }
